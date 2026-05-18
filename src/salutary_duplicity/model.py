@@ -46,7 +46,13 @@ class SalutaryModel:
         Private prior for each agent. Positive = leans toward site 1 (+1),
         negative = leans toward site 2 (-1).
     strategies : np.ndarray, shape (N,), dtype bool
-        True = Honest, False = Deceptive.
+        True = Honest, False = Deceptive. Used as the type label evolved by
+        Phase C replicator / imitation dynamics.
+    p : np.ndarray or None, shape (N,)
+        Per-agent honesty probability: agent j reports its true preference with
+        probability p[j] and flips the sign with probability 1 - p[j]
+        (Eq. 3.15 in the paper). If None, defaults to 1.0 for Honest agents
+        and 0.0 for Deceptive agents, recovering the deterministic regime.
     params : dict
         Model parameters. Missing keys fall back to DEFAULT_PARAMS.
     seed : int or None
@@ -60,11 +66,13 @@ class SalutaryModel:
         strategies: np.ndarray,
         params: dict[str, Any] | None = None,
         seed: int | None = None,
+        p: np.ndarray | None = None,
     ) -> None:
         self.G = G
         self.N = G.number_of_nodes()
         self.h = np.asarray(h, dtype=float)
         self.strategies = np.asarray(strategies, dtype=bool)  # True = Honest
+        self.p = self._resolve_p_vector(p)
         self.rng = np.random.default_rng(seed)
 
         # Merge with defaults
@@ -160,6 +168,19 @@ class SalutaryModel:
             return np.full(self.N, float(alpha_arr), dtype=float)
         return alpha_arr.astype(float, copy=True)
 
+    def _resolve_p_vector(self, p_raw: Any) -> np.ndarray:
+        """Resolve per-agent honesty probability, defaulting from strategies."""
+        if p_raw is None:
+            return self.strategies.astype(float, copy=True)
+        p_arr = np.asarray(p_raw, dtype=float)
+        if p_arr.ndim == 0:
+            p_arr = np.full(self.N, float(p_arr), dtype=float)
+        if len(p_arr) != self.N:
+            raise ValueError(f"p vector must have length {self.N}, got {len(p_arr)}.")
+        if np.any((p_arr < 0.0) | (p_arr > 1.0)):
+            raise ValueError("all p values must be in [0, 1].")
+        return p_arr.astype(float, copy=True)
+
     # ------------------------------------------------------------------
     # Phase A: Glauber dynamics
     # ------------------------------------------------------------------
@@ -168,17 +189,26 @@ class SalutaryModel:
         """
         Build effective coupling vector for each agent: J_ij per neighbor.
         Returns a list of arrays (one per agent) with signed couplings.
+
+        Sign of J_ij is determined by a Bernoulli(p_j) draw: with probability
+        p[j] neighbor j reports honestly (J_ij = +J), otherwise it lies
+        (J_ij = -J). Draws are quenched within a single Phase A realization.
         """
-        J = self.params["J_strength"]
-        # For each agent i, store array of J_ij for each neighbor j
+        J_raw = self.params["J_strength"]
+        J_arr = np.asarray(J_raw, dtype=float)
+        if J_arr.ndim == 2 and J_arr.shape != (self.N, self.N):
+            raise ValueError(
+                f"J_strength matrix must have shape ({self.N},{self.N}), got {J_arr.shape}."
+            )
         jeff: list[np.ndarray] = []
         for i in range(self.N):
             nbrs = self._neighbors[i]
             if len(nbrs) == 0:
                 jeff.append(np.array([], dtype=float))
             else:
-                # J_ij = +J if neighbor j is Honest, -J if Deceptive
-                couplings = np.where(self.strategies[nbrs], J, -J)
+                honest_draw = self.rng.random(len(nbrs)) < self.p[nbrs]
+                J_i = float(J_arr) if J_arr.ndim == 0 else J_arr[i, nbrs]
+                couplings = np.where(honest_draw, J_i, -J_i)
                 jeff.append(couplings)
         return jeff  # type: ignore[return-value]
 
@@ -247,8 +277,7 @@ class SalutaryModel:
         N2 = float(np.sum(spins == -1.0))
 
         def site_mu(Nk: float, FAk: float, Ck: float) -> float:
-            GP_k = (delta * Nk) / FAk
-            return Ck * np.exp(-gamma * max(0.0, GP_k - 1.0))
+            return Ck / (1.0 + np.exp(gamma * (delta * Nk - FAk)))
 
         mu1 = site_mu(N1, FA[0], C[0])
         mu2 = site_mu(N2, FA[1], C[1])
@@ -379,8 +408,10 @@ class SalutaryModel:
         eta = self.params["eta"]
         old_strategies = self.strategies.copy()
         old_alphas = self.alphas.copy()
+        old_p = self.p.copy()
         new_strategies = old_strategies.copy()
         new_alphas = old_alphas.copy()
+        new_p = old_p.copy()
 
         for i in range(self.N):
             nbrs = self._neighbors[i]
@@ -392,9 +423,11 @@ class SalutaryModel:
                 if self.rng.random() < prob:
                     new_strategies[i] = old_strategies[j]
                     new_alphas[i] = old_alphas[j]
+                    new_p[i] = old_p[j]
 
         self.strategies = new_strategies
         self.alphas = new_alphas
+        self.p = new_p
         self._p = float(np.mean(self.strategies))
 
     # ------------------------------------------------------------------
